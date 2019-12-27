@@ -57,14 +57,14 @@ To evalute the model, put the corresponding weights file in the `./weights` dire
 ```Shell
 # Quantitatively evaluate a trained model on the entire validation set. Make sure you have COCO downloaded as above.
 # This should get 29.92 validation mask mAP last time I checked.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --cuda=False
 
 # Output a COCOEval json to submit to the website or to use the run_coco_eval.py script.
 # This command will create './results/bbox_detections.json' and './results/mask_detections.json' for detection and instance segmentation respectively.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --output_coco_json
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --output_coco_json --cuda=False
 
 # You can run COCOEval on the files created in the previous command. The performance should match my implementation in eval.py.
-python run_coco_eval.py
+python run_coco_eval.py --cuda=False
 
 # To output a coco json file for test-dev, make sure you have test-dev downloaded from above and go
 python eval.py --trained_model=weights/yolact_base_54_800000.pth --output_coco_json --dataset=coco2017_testdev_dataset
@@ -72,7 +72,7 @@ python eval.py --trained_model=weights/yolact_base_54_800000.pth --output_coco_j
 ## Qualitative Results on COCO
 ```Shell
 # Display qualitative results on COCO. From here on I'll use a confidence threshold of 0.3.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --display
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --display --cuda=False
 ```
 ## Benchmarking on COCO
 ```Shell
@@ -82,24 +82,24 @@ python eval.py --trained_model=weights/yolact_base_54_800000.pth --benchmark --m
 ## Images
 ```Shell
 # Display qualitative results on the specified image.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --image=my_image.png
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --image=my_image.png --cuda=False
 
 # Process an image and save it to another file.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --image=input_image.png:output_image.png
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --image=input_image.png:output_image.png --cuda=False
 
 # Process a whole folder of images.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --images=path/to/input/folder:path/to/output/folder
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --images=path/to/input/folder:path/to/output/folder --cuda=False
 ```
 ## Video
 ```Shell
 # Display a video in real-time. "--video_multiframe" will process that many frames at once for improved performance.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --video_multiframe=2 --video=my_video.mp4
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --video_multiframe=2 --video=my_video.mp4 --cuda=False
 
 # Display a webcam feed in real-time. If you have multiple webcams pass the index of the webcam you want instead of 0.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --video_multiframe=2 --video=0
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --video_multiframe=2 --video=0 --cuda=False
 
 # Process a video and save it to another file. This is unoptimized.
-python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --video=input_video.mp4:output_video.mp4
+python eval.py --trained_model=weights/yolact_base_54_800000.pth --score_threshold=0.3 --top_k=100 --video=input_video.mp4:output_video.mp4 --cuda=False
 ```
 As you can tell, `eval.py` can do a ton of stuff. Run the `--help` command to see everything it can do.
 ```Shell
