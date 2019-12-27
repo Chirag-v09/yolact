@@ -80,51 +80,6 @@ def jaccard(box_a, box_b, iscrowd:bool=False):
     out = inter / area_a if iscrowd else inter / union
     return out if use_batch else out.squeeze(0)
 
-def elemwise_box_iou(box_a, box_b):
-    """ Does the same as above but instead of pairwise, elementwise along the inner dimension. """
-    max_xy = torch.min(box_a[:, 2:], box_b[:, 2:])
-    min_xy = torch.max(box_a[:, :2], box_b[:, :2])
-    inter = torch.clamp((max_xy - min_xy), min=0)
-    inter = inter[:, 0] * inter[:, 1]
-
-    area_a = (box_a[:, 2] - box_a[:, 0]) * (box_a[:, 3] - box_a[:, 1])
-    area_b = (box_b[:, 2] - box_b[:, 0]) * (box_b[:, 3] - box_b[:, 1])
-
-    union = area_a + area_b - inter
-    union = torch.clamp(union, min=0.1)
-
-    # Return value is [n] for inputs [n, 4]
-    return torch.clamp(inter / union, max=1)
-
-def mask_iou(masks_a, masks_b, iscrowd=False):
-    """
-    Computes the pariwise mask IoU between two sets of masks of size [a, h, w] and [b, h, w].
-    The output is of size [a, b].
-
-    Wait I thought this was "box_utils", why am I putting this in here?
-    """
-
-    masks_a = masks_a.view(masks_a.size(0), -1)
-    masks_b = masks_b.view(masks_b.size(0), -1)
-
-    intersection = masks_a @ masks_b.t()
-    area_a = masks_a.sum(dim=1).unsqueeze(1)
-    area_b = masks_b.sum(dim=1).unsqueeze(0)
-
-    return intersection / (area_a + area_b - intersection) if not iscrowd else intersection / area_a
-
-def elemwise_mask_iou(masks_a, masks_b):
-    """ Does the same as above but instead of pairwise, elementwise along the outer dimension. """
-    masks_a = masks_a.view(-1, masks_a.size(-1))
-    masks_b = masks_b.view(-1, masks_b.size(-1))
-
-    intersection = (masks_a * masks_b).sum(dim=0)
-    area_a = masks_a.sum(dim=0)
-    area_b = masks_b.sum(dim=0)
-
-    # Return value is [n] for inputs [h, w, n]
-    return torch.clamp(intersection / torch.clamp(area_a + area_b - intersection, min=0.1), max=1)
-
 
 
 def change(gt, priors):
@@ -181,31 +136,20 @@ def match(pos_thresh, neg_thresh, truths, priors, labels, crowd_boxes, loc_t, co
     # Size [num_objects, num_priors]
     overlaps = jaccard(truths, decoded_priors) if not cfg.use_change_matching else change(truths, decoded_priors)
 
+    # Size [num_objects] best prior for each ground truth
+    best_prior_overlap, best_prior_idx = overlaps.max(1)
     # Size [num_priors] best ground truth for each prior
     best_truth_overlap, best_truth_idx = overlaps.max(0)
+    
+    # For the best prior for each gt object, set its overlap to 2. This ensures
+    # that it won't get thresholded out in the threshold step even if the IoU is
+    # under the negative threshold. This is because we want at least one anchor
+    # to match with each ground truth or else we'd be wasting training data.
+    best_truth_overlap.index_fill_(0, best_prior_idx, 2)
 
-    # We want to ensure that each gt gets used at least once so that we don't
-    # waste any training data. In order to do that, find the max overlap anchor
-    # with each gt, and force that anchor to use that gt.
-    for _ in range(overlaps.size(0)):
-        # Find j, the gt with the highest overlap with a prior
-        # In effect, this will loop through overlaps.size(0) in a "smart" order,
-        # always choosing the highest overlap first.
-        best_prior_overlap, best_prior_idx = overlaps.max(1)
-        j = best_prior_overlap.max(0)[1]
-
-        # Find i, the highest overlap anchor with this gt
-        i = best_prior_idx[j]
-
-        # Set all other overlaps with i to be -1 so that no other gt uses it
-        overlaps[:, i] = -1
-        # Set all other overlaps with j to be -1 so that this loop never uses j again
-        overlaps[j, :] = -1
-
-        # Overwrite i's score to be 2 so it doesn't get thresholded ever
-        best_truth_overlap[i] = 2
-        # Set the gt to be used for i to be j, overwriting whatever was there
-        best_truth_idx[i] = j
+    # Set the index of the pair (prior, gt) we set the overlap for above.
+    for j in range(best_prior_idx.size(0)):
+        best_truth_idx[best_prior_idx[j]] = j
 
     matches = truths[best_truth_idx]            # Shape: [num_priors,4]
     conf = labels[best_truth_idx] + 1           # Shape: [num_priors]
@@ -372,6 +316,7 @@ def crop(masks, boxes, padding:int=1):
     crop_mask = masks_left * masks_right * masks_up * masks_down
     
     return masks * crop_mask.float()
+
 
 
 def index2d(src, idx):

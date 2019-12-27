@@ -2,11 +2,11 @@ from data import COCODetection, get_label_map, MEANS, COLORS
 from yolact import Yolact
 from utils.augmentations import BaseTransform, FastBaseTransform, Resize
 from utils.functions import MovingAverage, ProgressBar
-from layers.box_utils import jaccard, center_size, mask_iou
+from layers.box_utils import jaccard, center_size
 from utils import timer
 from utils.functions import SavePath
 from layers.output_utils import postprocess, undo_image_transformation
-import pycocotools
+import pycocotools,time
 
 from data import cfg, set_cfg, set_dataset
 
@@ -49,8 +49,6 @@ def parse_args(argv=None):
                         help='Use cuda to evaulate model')
     parser.add_argument('--fast_nms', default=True, type=str2bool,
                         help='Whether to use a faster, but not entirely correct version of NMS.')
-    parser.add_argument('--cross_class_nms', default=False, type=str2bool,
-                        help='Whether compute NMS cross-class or per-class.')
     parser.add_argument('--display_masks', default=True, type=str2bool,
                         help='Whether or not to display masks over bounding boxes')
     parser.add_argument('--display_bboxes', default=True, type=str2bool,
@@ -109,14 +107,9 @@ def parse_args(argv=None):
                         help='If specified, override the dataset specified in the config with this one (example: coco2017_dataset).')
     parser.add_argument('--detect', default=False, dest='detect', action='store_true',
                         help='Don\'t evauluate the mask branch at all and only do object detection. This only works for --display and --benchmark.')
-    parser.add_argument('--display_fps', default=False, dest='display_fps', action='store_true',
-                        help='When displaying / saving video, draw the FPS on the frame')
-    parser.add_argument('--emulate_playback', default=False, dest='emulate_playback', action='store_true',
-                        help='When saving a video, emulate the framerate that you\'d get running in real-time mode.')
 
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
-                        benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False, display_fps=False,
-                        emulate_playback=False)
+                        benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False)
 
     global args
     args = parser.parse_args(argv)
@@ -132,7 +125,7 @@ coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
 color_cache = defaultdict(lambda: {})
 
-def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45, fps_str=''):
+def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, mask_alpha=0.45):
     """
     Note: If undo_transform=False then im_h and im_w are allowed to be None.
     """
@@ -144,26 +137,27 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         h, w, _ = img.shape
     
     with timer.env('Postprocess'):
-        save = cfg.rescore_bbox
-        cfg.rescore_bbox = True
         t = postprocess(dets_out, w, h, visualize_lincomb = args.display_lincomb,
                                         crop_masks        = args.crop,
                                         score_threshold   = args.score_threshold)
-        cfg.rescore_bbox = save
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     with timer.env('Copy'):
-        idx = t[1].argsort(0, descending=True)[:args.top_k]
-        
         if cfg.eval_mask_branch:
             # Masks are drawn on the GPU, so don't copy
-            masks = t[3][idx]
-        classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]
+            masks = t[3][:args.top_k]
+        classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in t[:3]]
 
     num_dets_to_consider = min(args.top_k, classes.shape[0])
     for j in range(num_dets_to_consider):
         if scores[j] < args.score_threshold:
             num_dets_to_consider = j
             break
+    
+    if num_dets_to_consider == 0:
+        # No detections found so just output the original image
+        return (img_gpu * 255).byte().cpu().numpy()
 
     # Quick and dirty lambda for selecting the color for a particular index
     # Also keeps track of a per-gpu color cache for maximum speed
@@ -177,7 +171,7 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
             color = COLORS[color_idx]
             if not undo_transform:
                 # The image might come in as RGB or BRG, depending
-                color = (color[2], color[1], color[0])
+                color = torch.Tensor(color).float() / 255.
             if on_gpu is not None:
                 color = torch.Tensor(color).to(on_gpu).float() / 255.
                 color_cache[on_gpu][color_idx] = color
@@ -186,12 +180,15 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     # First, draw the masks on the GPU where we can do it really fast
     # Beware: very fast but possibly unintelligible mask-drawing code ahead
     # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
-    if args.display_masks and cfg.eval_mask_branch and num_dets_to_consider > 0:
+    if args.display_masks and cfg.eval_mask_branch:
         # After this, mask is of size [num_dets, h, w, 1]
         masks = masks[:num_dets_to_consider, :, :, None]
         
         # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
-        colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
+        if torch.cuda.is_available():
+            colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
+        else:
+            colors = torch.cat([get_color(j).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
         masks_color = masks.repeat(1, 1, 1, 3) * colors * mask_alpha
 
         # This is 1 everywhere except for 1-mask_alpha where the mask is
@@ -207,36 +204,15 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
             masks_color_summand += masks_color_cumul.sum(dim=0)
 
         img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
-    
-    if args.display_fps:
-            # Draw the box for the fps on the GPU
-        font_face = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 0.6
-        font_thickness = 1
-
-        text_w, text_h = cv2.getTextSize(fps_str, font_face, font_scale, font_thickness)[0]
-
-        img_gpu[0:text_h+8, 0:text_w+8] *= 0.6 # 1 - Box alpha
-
-
+        
     # Then draw the stuff that needs to be done on the cpu
     # Note, make sure this is a uint8 tensor or opencv will not anti alias text for whatever reason
     img_numpy = (img_gpu * 255).byte().cpu().numpy()
-
-    if args.display_fps:
-        # Draw the text on the CPU
-        text_pt = (4, text_h + 2)
-        text_color = [255, 255, 255]
-
-        cv2.putText(img_numpy, fps_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
     
-    if num_dets_to_consider == 0:
-        return img_numpy
-
     if args.display_text or args.display_bboxes:
         for j in reversed(range(num_dets_to_consider)):
             x1, y1, x2, y2 = boxes[j, :]
-            color = get_color(j)
+            color = tuple([int(x) for x in (get_color(j) * 255).numpy().astype(np.uint8)])
             score = scores[j]
 
             if args.display_bboxes:
@@ -257,7 +233,6 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
 
                 cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
                 cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
-            
     
     return img_numpy
 
@@ -266,15 +241,7 @@ def prep_benchmark(dets_out, h, w):
         t = postprocess(dets_out, w, h, crop_masks=args.crop, score_threshold=args.score_threshold)
 
     with timer.env('Copy'):
-        classes, scores, boxes, masks = [x[:args.top_k] for x in t]
-        if isinstance(scores, list):
-            box_scores = scores[0].cpu().numpy()
-            mask_scores = scores[1].cpu().numpy()
-        else:
-            scores = scores.cpu().numpy()
-        classes = classes.cpu().numpy()
-        boxes = boxes.cpu().numpy()
-        masks = masks.cpu().numpy()
+        classes, scores, boxes, masks = [x[:args.top_k].cpu().numpy() for x in t]
     
     with timer.env('Sync'):
         # Just in case
@@ -373,12 +340,27 @@ class Detections:
 
         
 
-def _mask_iou(mask1, mask2, iscrowd=False):
-    with timer.env('Mask IoU'):
-        ret = mask_iou(mask1, mask2, iscrowd)
+def mask_iou(mask1, mask2, iscrowd=False):
+    """
+    Inputs inputs are matricies of size _ x N. Output is size _1 x _2.
+    Note: if iscrowd is True, then mask2 should be the crowd.
+    """
+    timer.start('Mask IoU')
+
+    intersection = torch.matmul(mask1, mask2.t())
+    area1 = torch.sum(mask1, dim=1).view(1, -1)
+    area2 = torch.sum(mask2, dim=1).view(1, -1)
+    union = (area1.t() + area2) - intersection
+
+    if iscrowd:
+        # Make sure to brodcast to the right dimension
+        ret = intersection / area1.t()
+    else:
+        ret = intersection / union
+    timer.stop('Mask IoU')
     return ret.cpu()
 
-def _bbox_iou(bbox1, bbox2, iscrowd=False):
+def bbox_iou(bbox1, bbox2, iscrowd=False):
     with timer.env('BBox IoU'):
         ret = jaccard(bbox1, bbox2, iscrowd)
     return ret.cpu()
@@ -406,13 +388,7 @@ def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, de
             return
 
         classes = list(classes.cpu().numpy().astype(int))
-        if isinstance(scores, list):
-            box_scores = list(scores[0].cpu().numpy().astype(float))
-            mask_scores = list(scores[1].cpu().numpy().astype(float))
-        else:
-            scores = list(scores.cpu().numpy().astype(float))
-            box_scores = scores
-            mask_scores = scores
+        scores = list(scores.cpu().numpy().astype(float))
         masks = masks.view(-1, h*w).cuda()
         boxes = boxes.cuda()
 
@@ -424,34 +400,27 @@ def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, de
             for i in range(masks.shape[0]):
                 # Make sure that the bounding box actually makes sense and a mask was produced
                 if (boxes[i, 3] - boxes[i, 1]) * (boxes[i, 2] - boxes[i, 0]) > 0:
-                    detections.add_bbox(image_id, classes[i], boxes[i,:],   box_scores[i])
-                    detections.add_mask(image_id, classes[i], masks[i,:,:], mask_scores[i])
+                    detections.add_bbox(image_id, classes[i], boxes[i,:],   scores[i])
+                    detections.add_mask(image_id, classes[i], masks[i,:,:], scores[i])
             return
     
     with timer.env('Eval Setup'):
         num_pred = len(classes)
         num_gt   = len(gt_classes)
 
-        mask_iou_cache = _mask_iou(masks, gt_masks)
-        bbox_iou_cache = _bbox_iou(boxes.float(), gt_boxes.float())
+        mask_iou_cache = mask_iou(masks, gt_masks)
+        bbox_iou_cache = bbox_iou(boxes.float(), gt_boxes.float())
 
         if num_crowd > 0:
-            crowd_mask_iou_cache = _mask_iou(masks, crowd_masks, iscrowd=True)
-            crowd_bbox_iou_cache = _bbox_iou(boxes.float(), crowd_boxes.float(), iscrowd=True)
+            crowd_mask_iou_cache = mask_iou(masks, crowd_masks, iscrowd=True)
+            crowd_bbox_iou_cache = bbox_iou(boxes.float(), crowd_boxes.float(), iscrowd=True)
         else:
             crowd_mask_iou_cache = None
             crowd_bbox_iou_cache = None
 
-        box_indices = sorted(range(num_pred), key=lambda i: -box_scores[i])
-        mask_indices = sorted(box_indices, key=lambda i: -mask_scores[i])
-
         iou_types = [
-            ('box',  lambda i,j: bbox_iou_cache[i, j].item(),
-                     lambda i,j: crowd_bbox_iou_cache[i,j].item(),
-                     lambda i: box_scores[i], box_indices),
-            ('mask', lambda i,j: mask_iou_cache[i, j].item(),
-                     lambda i,j: crowd_mask_iou_cache[i,j].item(),
-                     lambda i: mask_scores[i], mask_indices)
+            ('box',  lambda i,j: bbox_iou_cache[i, j].item(), lambda i,j: crowd_bbox_iou_cache[i,j].item()),
+            ('mask', lambda i,j: mask_iou_cache[i, j].item(), lambda i,j: crowd_mask_iou_cache[i,j].item())
         ]
 
     timer.start('Main loop')
@@ -462,13 +431,13 @@ def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, de
         for iouIdx in range(len(iou_thresholds)):
             iou_threshold = iou_thresholds[iouIdx]
 
-            for iou_type, iou_func, crowd_func, score_func, indices in iou_types:
+            for iou_type, iou_func, crowd_func in iou_types:
                 gt_used = [False] * len(gt_classes)
                 
                 ap_obj = ap_data[iou_type][iouIdx][_class]
                 ap_obj.add_gt_positives(num_gt_for_class)
 
-                for i in indices:
+                for i in range(num_pred):
                     if classes[i] != _class:
                         continue
                     
@@ -486,7 +455,7 @@ def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, de
                     
                     if max_match_idx >= 0:
                         gt_used[max_match_idx] = True
-                        ap_obj.push(score_func(i), True)
+                        ap_obj.push(scores[i], True)
                     else:
                         # If the detection matches a crowd, we can just ignore it
                         matched_crowd = False
@@ -506,7 +475,7 @@ def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, de
                         # same result as COCOEval. There aren't even that many crowd annotations to
                         # begin with, but accuracy is of the utmost importance.
                         if not matched_crowd:
-                            ap_obj.push(score_func(i), False)
+                            ap_obj.push(scores[i], False)
     timer.stop('Main loop')
 
 
@@ -593,7 +562,11 @@ def badhash(x):
     return x
 
 def evalimage(net:Yolact, path:str, save_path:str=None):
-    frame = torch.from_numpy(cv2.imread(path)).cuda().float()
+    save_path_p = "/home/jarvis/yolact_cpu/t1.jpg"
+    frame = torch.from_numpy(cv2.imread(path))
+    if torch.cuda.is_available():
+        frame = frame.cuda()
+    frame = frame.float()
     batch = FastBaseTransform()(frame.unsqueeze(0))
     preds = net(batch)
 
@@ -603,9 +576,7 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
         img_numpy = img_numpy[:, :, (2, 1, 0)]
 
     if save_path is None:
-        plt.imshow(img_numpy)
-        plt.title(path)
-        plt.show()
+        cv2.imwrite(save_path_p, img_numpy)
     else:
         cv2.imwrite(save_path, img_numpy)
 
@@ -633,12 +604,9 @@ class CustomDataParallel(torch.nn.DataParallel):
         # Note that I don't actually want to convert everything to the output_device
         return sum(outputs, [])
 
-def evalvideo(net:Yolact, path:str, out_path:str=None):
+def evalvideo(net:Yolact, path:str):
     # If the path is a digit, parse it as a webcam index
     is_webcam = path.isdigit()
-    
-    # If the input image size is constant, this make things faster (hence why we can use it in a video setting).
-    cudnn.benchmark = True
     
     if is_webcam:
         vid = cv2.VideoCapture(int(path))
@@ -648,45 +616,24 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     if not vid.isOpened():
         print('Could not open video "%s"' % path)
         exit(-1)
-
-    target_fps   = round(vid.get(cv2.CAP_PROP_FPS))
-    frame_width  = round(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = round(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    num_frames   = round(vid.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    if is_webcam:
-        num_frames = float('inf')
-
     net = CustomDataParallel(net).cuda()
     transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
     frame_times = MovingAverage(100)
     fps = 0
-    frame_time_target = 1 / target_fps
+    # The 0.8 is to account for the overhead of time.sleep
+    frame_time_target = 1 / vid.get(cv2.CAP_PROP_FPS)
     running = True
-    fps_str = ''
-    vid_done = False
-    frames_displayed = 0
-
-    if out_path is not None:
-        out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height))
 
     def cleanup_and_exit():
         print()
         pool.terminate()
         vid.release()
-        if out_path is not None:
-            out.release()
         cv2.destroyAllWindows()
         exit()
 
     def get_next_frame(vid):
-        frames = []
-        for idx in range(args.video_multiframe):
-            frame = vid.read()[1]
-            if frame is None:
-                return frames
-            frames.append(frame)
-        return frames
+        return [vid.read()[1] for _ in range(args.video_multiframe)]
 
     def transform_frame(frames):
         with torch.no_grad():
@@ -696,182 +643,158 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     def eval_network(inp):
         with torch.no_grad():
             frames, imgs = inp
-            num_extra = 0
-            while imgs.size(0) < args.video_multiframe:
-                imgs = torch.cat([imgs, imgs[0].unsqueeze(0)], dim=0)
-                num_extra += 1
-            out = net(imgs)
-            if num_extra > 0:
-                out = out[:-num_extra]
-            return frames, out
+            return frames, net(imgs)
 
-    def prep_frame(inp, fps_str):
+    def prep_frame(inp):
         with torch.no_grad():
             frame, preds = inp
-            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str)
+            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True)
 
     frame_buffer = Queue()
     video_fps = 0
 
     # All this timing code to make sure that 
     def play_video():
-        try:
-            nonlocal frame_buffer, running, video_fps, is_webcam, num_frames, frames_displayed, vid_done
+        nonlocal frame_buffer, running, video_fps, is_webcam
 
-            video_frame_times = MovingAverage(100)
-            frame_time_stabilizer = frame_time_target
-            last_time = None
-            stabilizer_step = 0.0005
-            progress_bar = ProgressBar(30, num_frames)
+        video_frame_times = MovingAverage(100)
+        frame_time_stabilizer = frame_time_target
+        last_time = None
+        stabilizer_step = 0.0005
 
-            while running:
-                frame_time_start = time.time()
+        while running:
+            frame_time_start = time.time()
 
-                if not frame_buffer.empty():
-                    next_time = time.time()
-                    if last_time is not None:
-                        video_frame_times.add(next_time - last_time)
-                        video_fps = 1 / video_frame_times.get_avg()
-                    if out_path is None:
-                        cv2.imshow(path, frame_buffer.get())
-                    else:
-                        out.write(frame_buffer.get())
-                    frames_displayed += 1
-                    last_time = next_time
+            if not frame_buffer.empty():
+                next_time = time.time()
+                if last_time is not None:
+                    video_frame_times.add(next_time - last_time)
+                    video_fps = 1 / video_frame_times.get_avg()
+                cv2.imshow(path, frame_buffer.get())
+                last_time = next_time
 
-                    if out_path is not None:
-                        if video_frame_times.get_avg() == 0:
-                            fps = 0
-                        else:
-                            fps = 1 / video_frame_times.get_avg()
-                        progress = frames_displayed / num_frames * 100
-                        progress_bar.set_val(frames_displayed)
+            if cv2.waitKey(1) == 27: # Press Escape to close
+                running = False
 
-                        print('\rProcessing Frames  %s %6d / %6d (%5.2f%%)    %5.2f fps        '
-                            % (repr(progress_bar), frames_displayed, num_frames, progress, fps), end='')
+            buffer_size = frame_buffer.qsize()
+            if buffer_size < args.video_multiframe:
+                frame_time_stabilizer += stabilizer_step
+            elif buffer_size > args.video_multiframe:
+                frame_time_stabilizer -= stabilizer_step
+                if frame_time_stabilizer < 0:
+                    frame_time_stabilizer = 0
 
-                
-                # This is split because you don't want savevideo to require cv2 display functionality (see #197)
-                if out_path is None and cv2.waitKey(1) == 27:
-                    # Press Escape to close
-                    running = False
-                if not (frames_displayed < num_frames):
-                    running = False
+            new_target = frame_time_stabilizer if is_webcam else max(frame_time_stabilizer, frame_time_target)
 
-                if not vid_done:
-                    buffer_size = frame_buffer.qsize()
-                    if buffer_size < args.video_multiframe:
-                        frame_time_stabilizer += stabilizer_step
-                    elif buffer_size > args.video_multiframe:
-                        frame_time_stabilizer -= stabilizer_step
-                        if frame_time_stabilizer < 0:
-                            frame_time_stabilizer = 0
-
-                    new_target = frame_time_stabilizer if is_webcam else max(frame_time_stabilizer, frame_time_target)
-                else:
-                    new_target = frame_time_target
-
-                next_frame_target = max(2 * new_target - video_frame_times.get_avg(), 0)
-                target_time = frame_time_start + next_frame_target - 0.001 # Let's just subtract a millisecond to be safe
-                
-                if out_path is None or args.emulate_playback:
-                    # This gives more accurate timing than if sleeping the whole amount at once
-                    while time.time() < target_time:
-                        time.sleep(0.001)
-                else:
-                    # Let's not starve the main thread, now
-                    time.sleep(0.001)
-        except:
-            # See issue #197 for why this is necessary
-            import traceback
-            traceback.print_exc()
+            next_frame_target = max(2 * new_target - video_frame_times.get_avg(), 0)
+            target_time = frame_time_start + next_frame_target - 0.001 # Let's just subtract a millisecond to be safe
+            # This gives more accurate timing than if sleeping the whole amount at once
+            while time.time() < target_time:
+                time.sleep(0.001)
 
 
-    extract_frame = lambda x, i: (x[0][i] if x[1][i] is None else x[0][i].to(x[1][i]['detection']['box'].device), [x[1][i]])
+    extract_frame = lambda x, i: (x[0][i] if x[1][i] is None else x[0][i].to(x[1][i]['box'].device), [x[1][i]])
 
     # Prime the network on the first frame because I do some thread unsafe things otherwise
     print('Initializing model... ', end='')
-    first_batch = eval_network(transform_frame(get_next_frame(vid)))
+    eval_network(transform_frame(get_next_frame(vid)))
     print('Done.')
 
     # For each frame the sequence of functions it needs to go through to be processed (in reversed order)
     sequence = [prep_frame, eval_network, transform_frame]
     pool = ThreadPool(processes=len(sequence) + args.video_multiframe + 2)
     pool.apply_async(play_video)
-    active_frames = [{'value': extract_frame(first_batch, i), 'idx': 0} for i in range(len(first_batch[0]))]
+
+    active_frames = []
 
     print()
-    if out_path is None: print('Press Escape to close.')
-    try:
-        while vid.isOpened() and running:
-            # Hard limit on frames in buffer so we don't run out of memory >.>
-            while frame_buffer.qsize() > 100:
-                time.sleep(0.001)
+    while vid.isOpened() and running:
+        start_time = time.time()
 
-            start_time = time.time()
+        # Start loading the next frames from the disk
+        next_frames = pool.apply_async(get_next_frame, args=(vid,))
+        
+        # For each frame in our active processing queue, dispatch a job
+        # for that frame using the current function in the sequence
+        for frame in active_frames:
+            frame['value'] = pool.apply_async(sequence[frame['idx']], args=(frame['value'],))
+        
+        # For each frame whose job was the last in the sequence (i.e. for all final outputs)
+        for frame in active_frames:
+            if frame['idx'] == 0:
+                frame_buffer.put(frame['value'].get())
 
-            # Start loading the next frames from the disk
-            if not vid_done:
-                next_frames = pool.apply_async(get_next_frame, args=(vid,))
-            else:
-                next_frames = None
-            
-            if not (vid_done and len(active_frames) == 0):
-                # For each frame in our active processing queue, dispatch a job
-                # for that frame using the current function in the sequence
-                for frame in active_frames:
-                    _args =  [frame['value']]
-                    if frame['idx'] == 0:
-                        _args.append(fps_str)
-                    frame['value'] = pool.apply_async(sequence[frame['idx']], args=_args)
-                
-                # For each frame whose job was the last in the sequence (i.e. for all final outputs)
-                for frame in active_frames:
-                    if frame['idx'] == 0:
-                        frame_buffer.put(frame['value'].get())
+        # Remove the finished frames from the processing queue
+        active_frames = [x for x in active_frames if x['idx'] > 0]
 
-                # Remove the finished frames from the processing queue
-                active_frames = [x for x in active_frames if x['idx'] > 0]
+        # Finish evaluating every frame in the processing queue and advanced their position in the sequence
+        for frame in list(reversed(active_frames)):
+            frame['value'] = frame['value'].get()
+            frame['idx'] -= 1
 
-                # Finish evaluating every frame in the processing queue and advanced their position in the sequence
-                for frame in list(reversed(active_frames)):
-                    frame['value'] = frame['value'].get()
-                    frame['idx'] -= 1
+            if frame['idx'] == 0:
+                # Split this up into individual threads for prep_frame since it doesn't support batch size
+                active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0} for i in range(1, args.video_multiframe)]
+                frame['value'] = extract_frame(frame['value'], 0)
 
-                    if frame['idx'] == 0:
-                        # Split this up into individual threads for prep_frame since it doesn't support batch size
-                        active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0} for i in range(1, len(frame['value'][0]))]
-                        frame['value'] = extract_frame(frame['value'], 0)
-                
-                # Finish loading in the next frames and add them to the processing queue
-                if next_frames is not None:
-                    frames = next_frames.get()
-                    if len(frames) == 0:
-                        vid_done = True
-                    else:
-                        active_frames.append({'value': frames, 'idx': len(sequence)-1})
+        
+        # Finish loading in the next frames and add them to the processing queue
+        active_frames.append({'value': next_frames.get(), 'idx': len(sequence)-1})
+        
+        # Compute FPS
+        frame_times.add(time.time() - start_time)
+        fps = args.video_multiframe / frame_times.get_avg()
 
-                # Compute FPS
-                frame_times.add(time.time() - start_time)
-                fps = args.video_multiframe / frame_times.get_avg()
-            else:
-                fps = 0
-            
-            fps_str = 'Processing FPS: %.2f | Video Playback FPS: %.2f | Frames in Buffer: %d' % (fps, video_fps, frame_buffer.qsize())
-            if not args.display_fps:
-                print('\r' + fps_str + '    ', end='')
-
-    except KeyboardInterrupt:
-        print('\nStopping...')
+        print('\rProcessing FPS: %.2f | Video Playback FPS: %.2f | Frames in Buffer: %d    ' % (fps, video_fps, frame_buffer.qsize()), end='')
     
     cleanup_and_exit()
 
+def savevideo(net:Yolact, in_path:str, out_path:str):
+
+    vid = cv2.VideoCapture(in_path)
+
+    target_fps   = round(vid.get(cv2.CAP_PROP_FPS))
+    frame_width  = round(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = round(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    num_frames   = round(vid.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (frame_width, frame_height))
+
+    transform = FastBaseTransform()
+    frame_times = MovingAverage()
+    progress_bar = ProgressBar(30, num_frames)
+
+    try:
+        for i in range(num_frames):
+            timer.reset()
+            with timer.env('Video'):
+                frame = torch.from_numpy(vid.read()[1]).cuda().float()
+                batch = transform(frame.unsqueeze(0))
+                preds = net(batch)
+                processed = prep_display(preds, frame, None, None, undo_transform=False, class_color=True)
+
+                out.write(processed)
+            
+            if i > 1:
+                frame_times.add(timer.total_time())
+                fps = 1 / frame_times.get_avg()
+                progress = (i+1) / num_frames * 100
+                progress_bar.set_val(i+1)
+
+                print('\rProcessing Frames  %s %6d / %6d (%5.2f%%)    %5.2f fps        '
+                    % (repr(progress_bar), i+1, num_frames, progress, fps), end='')
+    except KeyboardInterrupt:
+        print('Stopping early.')
+    
+    vid.release()
+    out.release()
+    print()
+
+
 def evaluate(net:Yolact, dataset, train_mode=False):
     net.detect.use_fast_nms = args.fast_nms
-    net.detect.use_cross_class_nms = args.cross_class_nms
     cfg.mask_proto_debug = args.mask_proto_debug
 
-    # TODO Currently we do not support Fast Mask Re-scroing in evalimage, evalimages, and evalvideo
     if args.image is not None:
         if ':' in args.image:
             inp, out = args.image.split(':')
@@ -886,7 +809,7 @@ def evaluate(net:Yolact, dataset, train_mode=False):
     elif args.video is not None:
         if ':' in args.video:
             inp, out = args.video.split(':')
-            evalvideo(net, inp, out)
+            savevideo(net, inp, out)
         else:
             evalvideo(net, args.video)
         return
@@ -946,6 +869,7 @@ def evaluate(net:Yolact, dataset, train_mode=False):
 
             with timer.env('Network Extra'):
                 preds = net(batch)
+
             # Perform the meat of the operation here depending on our mode.
             if args.display:
                 img_numpy = prep_display(preds, img, h, w)
@@ -1025,9 +949,6 @@ def calc_map(ap_data):
         all_maps[iou_type]['all'] = (sum(all_maps[iou_type].values()) / (len(all_maps[iou_type].values())-1))
     
     print_maps(all_maps)
-    
-    # Put in a prettier format so we can serialize it to json during training
-    all_maps = {k: {j: round(u, 2) for j, u in v.items()} for k, v in all_maps.items()}
     return all_maps
 
 def print_maps(all_maps):
@@ -1039,13 +960,14 @@ def print_maps(all_maps):
     print(make_row([''] + [('.%d ' % x if isinstance(x, int) else x + ' ') for x in all_maps['box'].keys()]))
     print(make_sep(len(all_maps['box']) + 1))
     for iou_type in ('box', 'mask'):
-        print(make_row([iou_type] + ['%.2f' % x if x < 100 else '%.1f' % x for x in all_maps[iou_type].values()]))
+        print(make_row([iou_type] + ['%.2f' % x for x in all_maps[iou_type].values()]))
     print(make_sep(len(all_maps['box']) + 1))
     print()
 
 
 
 if __name__ == '__main__':
+    s_t =time.time()
     parse_args()
 
     if args.config is not None:
@@ -1074,6 +996,7 @@ if __name__ == '__main__':
             os.makedirs('results')
 
         if args.cuda:
+            cudnn.benchmark = True
             cudnn.fastest = True
             torch.set_default_tensor_type('torch.cuda.FloatTensor')
         else:
@@ -1094,7 +1017,8 @@ if __name__ == '__main__':
 
         print('Loading model...', end='')
         net = Yolact()
-        net.load_weights(args.trained_model)
+        map_location = None if args.cuda else 'cpu'
+        net.load_weights(args.trained_model, map_location=map_location)
         net.eval()
         print(' Done.')
 
@@ -1102,5 +1026,6 @@ if __name__ == '__main__':
             net = net.cuda()
 
         evaluate(net, dataset)
+        print("time_taken",time.time()-s_t)
 
 
